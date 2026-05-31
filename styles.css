@@ -151,6 +151,139 @@ button { font-family: inherit; }
 [data-theme="light"] #themeToggle .icon-moon { display: none; }
 [data-theme="light"] #themeToggle .icon-sun { display: block; }
 
+.sync-btn { width: 38px; padding: 0; position: relative; }
+.sync-btn svg { width: 16px; height: 16px; }
+.sync-btn.syncing svg { animation: spin 1.2s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.sync-dot {
+  position: absolute;
+  top: 6px; right: 6px;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text-mute);
+  transition: background 0.3s, box-shadow 0.3s;
+}
+.sync-btn[data-status="on"] .sync-dot {
+  background: #8fa68e;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #8fa68e 30%, transparent);
+}
+.sync-btn[data-status="error"] .sync-dot {
+  background: #c97a7a;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #c97a7a 30%, transparent);
+}
+.sync-btn[data-status="busy"] .sync-dot {
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.sync-card { max-width: 540px; }
+.sync-section {
+  display: flex; flex-direction: column; gap: 18px;
+}
+.sync-blurb {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text-soft);
+  max-width: 50ch;
+}
+.sync-blurb strong { color: var(--text); font-weight: 500; }
+.sync-tabs {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.sync-tab {
+  background: transparent; border: none;
+  padding: 10px;
+  color: var(--text-soft);
+  font-family: inherit; font-size: 12.5px; font-weight: 500;
+  cursor: pointer;
+  border-radius: 9px;
+  transition: all 0.2s;
+}
+.sync-tab.active { background: var(--bg-elev-2); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+.sync-tab:hover:not(.active) { color: var(--text); }
+
+.sync-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: var(--text);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12.5px;
+  letter-spacing: 0.02em;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.sync-input:focus { border-color: var(--accent); }
+.sync-input::placeholder { color: var(--text-mute); font-style: normal; }
+
+.sync-status-card {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 18px;
+  background: linear-gradient(180deg, var(--bg-elev) 0%, transparent 100%);
+}
+.sync-status-line {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+.sync-status-line .sync-dot {
+  position: static;
+  background: #8fa68e;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #8fa68e 25%, transparent);
+}
+.sync-status-line strong { color: var(--text); font-weight: 500; }
+.sync-status-line span { color: var(--text-soft); }
+
+.sync-gist-id {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--text-soft);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.sync-gist-id button {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-soft);
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 5px 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.2s;
+}
+.sync-gist-id button:hover { color: var(--text); border-color: var(--accent); }
+.sync-help {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  font-style: italic;
+  line-height: 1.5;
+}
+.sync-help a { color: var(--accent); text-decoration: none; border-bottom: 1px solid currentColor; }
+.sync-error {
+  font-size: 12.5px;
+  color: #c97a7a;
+  padding: 10px 14px;
+  background: rgba(201, 122, 122, 0.08);
+  border: 1px solid rgba(201, 122, 122, 0.2);
+  border-radius: 8px;
+}
+
 /* ── HERO ───────────────────────────────────────────────────────── */
 main {
   position: relative; z-index: 1;

@@ -5,6 +5,7 @@
 const STORAGE_KEY = "rituel_v2";
 const LEGACY_KEYS = ["rituel_v1"];
 const THEME_KEY = "rituel_theme";
+const SYNC_KEY = "rituel_sync_v1";
 
 /* ── FREQUENCY (array of JS day indices, 0=dim ... 6=sam) ─────── */
 const DAYS_ALL     = [0, 1, 2, 3, 4, 5, 6];
@@ -144,8 +145,10 @@ function seedState() {
   return seeded;
 }
 
-function saveState(s = state) {
+function saveState(s = state, opts = {}) {
+  s.updatedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+  if (!opts.skipSync) syncPushDebounced();
 }
 
 function id() {
@@ -947,6 +950,334 @@ function toast(msg) {
   }, 2200);
 }
 
+/* ── SYNC : GitHub Gist (private) ─────────────────────────────── */
+const sync = {
+  token: null,
+  gistId: null,
+  lastPulledAt: null,
+  lastPushedAt: null,
+  pushTimer: null,
+  busy: false,
+  error: null,
+};
+
+function loadSync() {
+  try {
+    const raw = localStorage.getItem(SYNC_KEY);
+    if (!raw) return;
+    const { token, gistId } = JSON.parse(raw);
+    sync.token = token || null;
+    sync.gistId = gistId || null;
+  } catch (e) {}
+}
+function saveSyncConfig() {
+  if (sync.token && sync.gistId) {
+    localStorage.setItem(SYNC_KEY, JSON.stringify({ token: sync.token, gistId: sync.gistId }));
+  } else {
+    localStorage.removeItem(SYNC_KEY);
+  }
+}
+function setSyncStatus(status) {
+  const btn = document.getElementById("syncBtn");
+  if (!btn) return;
+  btn.dataset.status = status || "";
+  btn.classList.toggle("syncing", status === "busy");
+}
+function syncEnabled() { return !!(sync.token && sync.gistId); }
+
+async function ghGist(method, path = "", body = null) {
+  const res = await fetch(`https://api.github.com/gists${path}`, {
+    method,
+    headers: {
+      "Authorization": `token ${sync.token}`,
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    let msg = `GitHub ${res.status}`;
+    try { msg = JSON.parse(txt).message || msg; } catch {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+async function syncCreate(token) {
+  if (!token || !token.trim()) throw new Error("Token requis.");
+  sync.token = token.trim();
+  sync.busy = true;
+  setSyncStatus("busy");
+  try {
+    const gist = await ghGist("POST", "", {
+      description: "Rituel — données personnelles (chiffré par token GitHub)",
+      public: false,
+      files: {
+        "rituel-data.json": { content: JSON.stringify(state, null, 2) },
+      },
+    });
+    sync.gistId = gist.id;
+    sync.lastPushedAt = Date.now();
+    saveSyncConfig();
+    sync.error = null;
+    setSyncStatus("on");
+    return gist.id;
+  } catch (e) {
+    sync.error = e.message;
+    sync.token = null;
+    setSyncStatus("error");
+    throw e;
+  } finally {
+    sync.busy = false;
+  }
+}
+
+async function syncPair(token, gistId) {
+  if (!token || !token.trim()) throw new Error("Token requis.");
+  if (!gistId || !gistId.trim()) throw new Error("Code de partage requis.");
+  sync.token = token.trim();
+  sync.gistId = gistId.trim();
+  sync.busy = true;
+  setSyncStatus("busy");
+  try {
+    const gist = await ghGist("GET", `/${sync.gistId}`);
+    const file = gist.files["rituel-data.json"];
+    if (!file) throw new Error("Données introuvables dans ce gist.");
+    let content = file.content;
+    if (file.truncated && file.raw_url) {
+      content = await fetch(file.raw_url).then(r => r.text());
+    }
+    const remote = JSON.parse(content);
+    if (!remote.habits) throw new Error("Format de données invalide.");
+    state = remote;
+    if (!state.notes) state.notes = [];
+    saveState(state, { skipSync: true });
+    saveSyncConfig();
+    sync.lastPulledAt = Date.now();
+    sync.error = null;
+    setSyncStatus("on");
+    renderAll();
+    return true;
+  } catch (e) {
+    sync.error = e.message;
+    sync.token = null;
+    sync.gistId = null;
+    setSyncStatus("error");
+    throw e;
+  } finally {
+    sync.busy = false;
+  }
+}
+
+async function syncPull(silent = true) {
+  if (!syncEnabled() || sync.busy) return;
+  sync.busy = true;
+  setSyncStatus("busy");
+  try {
+    const gist = await ghGist("GET", `/${sync.gistId}`);
+    const file = gist.files["rituel-data.json"];
+    if (!file) return;
+    let content = file.content;
+    if (file.truncated && file.raw_url) {
+      content = await fetch(file.raw_url).then(r => r.text());
+    }
+    const remote = JSON.parse(content);
+    const remoteAt = remote.updatedAt || 0;
+    const localAt = state.updatedAt || 0;
+    if (remoteAt > localAt) {
+      state = remote;
+      if (!state.notes) state.notes = [];
+      saveState(state, { skipSync: true });
+      renderAll();
+      if (!silent) toast("Données actualisées.");
+    }
+    sync.lastPulledAt = Date.now();
+    sync.error = null;
+    setSyncStatus("on");
+  } catch (e) {
+    sync.error = e.message;
+    setSyncStatus("error");
+    if (!silent) toast("Échec de la synchronisation.");
+  } finally {
+    sync.busy = false;
+  }
+}
+
+function syncPushDebounced() {
+  if (!syncEnabled()) return;
+  clearTimeout(sync.pushTimer);
+  sync.pushTimer = setTimeout(() => syncPush(), 1500);
+}
+
+async function syncPush() {
+  if (!syncEnabled() || sync.busy) {
+    // Retry shortly if currently busy
+    if (sync.busy) {
+      clearTimeout(sync.pushTimer);
+      sync.pushTimer = setTimeout(() => syncPush(), 2000);
+    }
+    return;
+  }
+  sync.busy = true;
+  setSyncStatus("busy");
+  try {
+    await ghGist("PATCH", `/${sync.gistId}`, {
+      files: { "rituel-data.json": { content: JSON.stringify(state, null, 2) } },
+    });
+    sync.lastPushedAt = Date.now();
+    sync.error = null;
+    setSyncStatus("on");
+  } catch (e) {
+    sync.error = e.message;
+    setSyncStatus("error");
+  } finally {
+    sync.busy = false;
+  }
+}
+
+function syncDisable() {
+  if (!confirm("Désactiver la synchronisation sur cet appareil ? Les données locales sont conservées et le gist GitHub n'est pas supprimé.")) return;
+  sync.token = null;
+  sync.gistId = null;
+  saveSyncConfig();
+  setSyncStatus("");
+  renderSyncModal();
+  toast("Synchronisation désactivée.");
+}
+
+/* ── SYNC MODAL UI ───────────────────────────────────────────── */
+function openSyncModal() {
+  document.getElementById("syncModal").hidden = false;
+  renderSyncModal();
+}
+function closeSyncModal() {
+  document.getElementById("syncModal").hidden = true;
+}
+
+let syncTab = "create"; // 'create' | 'join'
+
+function renderSyncModal() {
+  const body = document.getElementById("syncBody");
+  if (!body) return;
+
+  if (syncEnabled()) {
+    body.innerHTML = `
+      <div class="sync-section">
+        <p class="sync-blurb">
+          Vos données sont synchronisées en temps réel via un <strong>gist GitHub privé</strong>.
+          Chaque modification est poussée automatiquement, et l'app récupère les changements
+          à chaque ouverture.
+        </p>
+        <div class="sync-status-card">
+          <div class="sync-status-line">
+            <span class="sync-dot"></span>
+            <strong>Synchronisé</strong>
+            <span id="syncLastInfo">${syncLastInfoText()}</span>
+          </div>
+          <span class="field-label" style="display:block;margin-bottom:8px;">Code de partage</span>
+          <div class="sync-gist-id">
+            <span>${escapeHtml(sync.gistId)}</span>
+            <button type="button" id="copyGistBtn">Copier</button>
+          </div>
+          <p class="sync-help" style="margin-top:10px;">
+            Collez ce code (et le même token) dans l'app sur votre autre appareil pour le connecter.
+          </p>
+        </div>
+        ${sync.error ? `<div class="sync-error">Dernière erreur : ${escapeHtml(sync.error)}</div>` : ""}
+        <div class="modal-actions" style="border:none;padding-top:0;margin-top:0;">
+          <button type="button" class="ghost-btn danger" id="syncDisableBtn">Désactiver sur cet appareil</button>
+          <div class="spacer"></div>
+          <button type="button" class="ghost-btn" id="syncPullNowBtn">Actualiser</button>
+          <button type="button" class="primary-btn" data-close-sync="1">Fermer</button>
+        </div>
+      </div>
+    `;
+    document.getElementById("syncDisableBtn").addEventListener("click", syncDisable);
+    document.getElementById("syncPullNowBtn").addEventListener("click", () => syncPull(false));
+    document.getElementById("copyGistBtn").addEventListener("click", () => {
+      navigator.clipboard.writeText(sync.gistId).then(() => toast("Code copié."));
+    });
+  } else {
+    body.innerHTML = `
+      <div class="sync-section">
+        <p class="sync-blurb">
+          Synchronisez vos rituels et notes entre votre Mac et votre iPhone.
+          Vos données restent <strong>chez vous</strong>, dans un gist GitHub privé que vous seul pouvez lire.
+        </p>
+        <div class="sync-tabs">
+          <button type="button" class="sync-tab ${syncTab === "create" ? "active" : ""}" data-tab="create">Premier appareil</button>
+          <button type="button" class="sync-tab ${syncTab === "join" ? "active" : ""}" data-tab="join">Rejoindre</button>
+        </div>
+        <div class="field">
+          <span class="field-label">Token GitHub <span class="field-opt">(scope <code>gist</code>)</span></span>
+          <input type="password" class="sync-input" id="syncTokenInput" placeholder="ghp_…" autocomplete="off" spellcheck="false" />
+        </div>
+        ${syncTab === "join" ? `
+          <div class="field">
+            <span class="field-label">Code de partage <span class="field-opt">(depuis le premier appareil)</span></span>
+            <input type="text" class="sync-input" id="syncGistInput" placeholder="abc123…" autocomplete="off" spellcheck="false" />
+          </div>
+          <p class="sync-help">
+            <strong style="color:var(--text-soft);">Attention :</strong> rejoindre remplace toutes les données locales par celles du gist.
+          </p>
+        ` : `
+          <p class="sync-help">
+            Premier appareil ? Je crée un gist privé avec vos données actuelles et vous obtenez un code à coller sur l'iPhone.
+          </p>
+        `}
+        <p class="sync-help">
+          Pas encore de token ? <a href="https://github.com/settings/tokens/new?scopes=gist&description=Rituel%20sync" target="_blank" rel="noopener">Générez-en un</a> (scope <code>gist</code> uniquement).
+        </p>
+        ${sync.error ? `<div class="sync-error">${escapeHtml(sync.error)}</div>` : ""}
+        <div class="modal-actions" style="border:none;padding-top:0;margin-top:4px;">
+          <div class="spacer"></div>
+          <button type="button" class="ghost-btn" data-close-sync="1">Annuler</button>
+          <button type="button" class="primary-btn" id="syncActivateBtn">
+            ${syncTab === "create" ? "Créer la synchronisation" : "Rejoindre"}
+          </button>
+        </div>
+      </div>
+    `;
+    body.querySelectorAll(".sync-tab").forEach(t => {
+      t.addEventListener("click", () => { syncTab = t.dataset.tab; renderSyncModal(); });
+    });
+    document.getElementById("syncActivateBtn").addEventListener("click", async () => {
+      const tokenInput = document.getElementById("syncTokenInput");
+      const btn = document.getElementById("syncActivateBtn");
+      const token = tokenInput.value.trim();
+      if (!token) {
+        sync.error = "Token requis.";
+        renderSyncModal();
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "…";
+      try {
+        if (syncTab === "create") {
+          await syncCreate(token);
+          toast("Synchronisation activée.");
+        } else {
+          const gistId = document.getElementById("syncGistInput").value.trim();
+          await syncPair(token, gistId);
+          toast("Appareil connecté.");
+        }
+        renderSyncModal();
+      } catch (e) {
+        renderSyncModal();
+      }
+    });
+  }
+}
+
+function syncLastInfoText() {
+  if (sync.busy) return "· en cours…";
+  const last = Math.max(sync.lastPulledAt || 0, sync.lastPushedAt || 0);
+  if (!last) return "";
+  return `· ${relativeTime(last)}`;
+}
+
 /* ── THEME ───────────────────────────────────────────────────── */
 function initTheme() {
   const saved = localStorage.getItem(THEME_KEY) || "dark";
@@ -966,6 +1297,21 @@ function wire() {
   document.getElementById("openAddHabit").addEventListener("click", () => openModal());
   document.getElementById("openAddHabitEmpty").addEventListener("click", () => openModal());
   document.getElementById("themeToggle").addEventListener("click", toggleTheme);
+  document.getElementById("syncBtn").addEventListener("click", openSyncModal);
+
+  // Sync modal close
+  document.getElementById("syncModal").addEventListener("click", e => {
+    if (e.target.dataset.closeSync === "1" || e.target.closest("[data-close-sync='1']")) closeSyncModal();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && !document.getElementById("syncModal").hidden) closeSyncModal();
+  });
+
+  // Pull from gist when app comes back to foreground / network returns
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && syncEnabled()) syncPull(true);
+  });
+  window.addEventListener("online", () => { if (syncEnabled()) syncPull(true); });
 
   // Modal close
   document.getElementById("modal").addEventListener("click", e => {
@@ -1061,6 +1407,15 @@ function renderAll() {
 }
 
 initTheme();
+loadSync();
 renderAll();
 renderQuote();
 wire();
+
+// Initial sync pull (and reflect status in the nav dot)
+if (syncEnabled()) {
+  setSyncStatus("on");
+  syncPull(true);
+} else {
+  setSyncStatus("");
+}
