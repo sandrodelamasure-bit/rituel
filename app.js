@@ -970,6 +970,74 @@ function loadSync() {
     sync.gistId = gistId || null;
   } catch (e) {}
 }
+
+/**
+ * Parses #sync=base64(token:gistId) from the URL, configures sync,
+ * then performs a smart initial sync (push local if gist is a placeholder,
+ * otherwise pull remote into local).
+ */
+async function checkSyncFromUrl() {
+  const hash = location.hash || "";
+  const m = hash.match(/[#&]sync=([^&]+)/);
+  if (!m) return;
+  try {
+    const decoded = atob(m[1].replace(/-/g, "+").replace(/_/g, "/"));
+    const idx = decoded.indexOf(":");
+    if (idx < 0) return;
+    const token = decoded.slice(0, idx);
+    const gistId = decoded.slice(idx + 1);
+    if (!token || !gistId) return;
+    sync.token = token;
+    sync.gistId = gistId;
+    saveSyncConfig();
+    // Strip the hash from the URL immediately so it doesn't linger in history
+    history.replaceState(null, "", location.pathname + location.search);
+    await syncInitial();
+  } catch (e) {
+    sync.error = "Lien de sync invalide : " + e.message;
+    setSyncStatus("error");
+  }
+}
+
+async function syncInitial() {
+  if (!syncEnabled()) return;
+  sync.busy = true;
+  setSyncStatus("busy");
+  try {
+    const gist = await ghGist("GET", `/${sync.gistId}`);
+    const file = gist.files["rituel-data.json"];
+    let remote = null;
+    if (file) {
+      let content = file.content;
+      if (file.truncated && file.raw_url) {
+        content = await fetch(file.raw_url).then(r => r.text());
+      }
+      try { remote = JSON.parse(content); } catch {}
+    }
+    if (!remote || remote._placeholder || !remote.habits) {
+      // Gist is fresh — push local data up
+      sync.busy = false;
+      await syncPush();
+      toast("Synchronisation activée. Vos données sont en ligne.");
+    } else {
+      // Gist already has data — replace local
+      state = remote;
+      if (!state.notes) state.notes = [];
+      saveState(state, { skipSync: true });
+      renderAll();
+      sync.lastPulledAt = Date.now();
+      toast("Synchronisation activée. Données récupérées.");
+    }
+    sync.error = null;
+    setSyncStatus("on");
+  } catch (e) {
+    sync.error = e.message;
+    setSyncStatus("error");
+    toast("Échec de l'activation : " + e.message);
+  } finally {
+    sync.busy = false;
+  }
+}
 function saveSyncConfig() {
   if (sync.token && sync.gistId) {
     localStorage.setItem(SYNC_KEY, JSON.stringify({ token: sync.token, gistId: sync.gistId }));
@@ -1412,10 +1480,14 @@ renderAll();
 renderQuote();
 wire();
 
-// Initial sync pull (and reflect status in the nav dot)
-if (syncEnabled()) {
-  setSyncStatus("on");
-  syncPull(true);
-} else {
-  setSyncStatus("");
-}
+// Check for magic-link sync activation first, then normal pull
+(async () => {
+  if (location.hash && location.hash.includes("sync=")) {
+    await checkSyncFromUrl();
+  } else if (syncEnabled()) {
+    setSyncStatus("on");
+    syncPull(true);
+  } else {
+    setSyncStatus("");
+  }
+})();
