@@ -1382,6 +1382,11 @@ function wire() {
   });
   window.addEventListener("online", () => { if (syncEnabled()) syncPull(true); });
 
+  // Periodic pull every 30 s to catch changes from other devices
+  setInterval(() => {
+    if (syncEnabled() && document.visibilityState === "visible") syncPull(true);
+  }, 30_000);
+
   // Modal close
   document.getElementById("modal").addEventListener("click", e => {
     if (e.target.dataset.close === "1" || e.target.closest("[data-close='1']")) closeModal();
