@@ -78,6 +78,17 @@ const QUOTES = [
   { t: "Une habitude, à force d'être répétée, devient une seconde nature.", a: "Cicéron" },
 ];
 
+/* ── SYNC STATE (hoisted: read by saveState which runs at load time) ─ */
+const sync = {
+  token: null,
+  gistId: null,
+  lastPulledAt: null,
+  lastPushedAt: null,
+  pushTimer: null,
+  busy: false,
+  error: null,
+};
+
 /* ── STATE ───────────────────────────────────────────────────── */
 let state = loadState();
 
@@ -951,16 +962,6 @@ function toast(msg) {
 }
 
 /* ── SYNC : GitHub Gist (private) ─────────────────────────────── */
-const sync = {
-  token: null,
-  gistId: null,
-  lastPulledAt: null,
-  lastPushedAt: null,
-  pushTimer: null,
-  busy: false,
-  error: null,
-};
-
 function loadSync() {
   try {
     const raw = localStorage.getItem(SYNC_KEY);
