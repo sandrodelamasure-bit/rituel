@@ -157,7 +157,7 @@ function seedState() {
 }
 
 function saveState(s = state, opts = {}) {
-  s.updatedAt = Date.now();
+  if (!opts.skipSync) s.updatedAt = Date.now(); // preserve remote updatedAt on pulls
   localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
   if (!opts.skipSync) syncPushDebounced();
 }
@@ -1020,8 +1020,13 @@ async function syncInitial() {
       sync.busy = false;
       await syncPush();
       toast("Synchronisation activée. Vos données sont en ligne.");
+    } else if ((state.updatedAt || 0) >= (remote.updatedAt || 0)) {
+      // Local is newer or same — push to gist
+      sync.busy = false;
+      await syncPush();
+      toast("Synchronisation activée. Vos données locales ont été envoyées.");
     } else {
-      // Gist already has data — replace local
+      // Remote is newer — pull into local
       state = remote;
       if (!state.notes) state.notes = [];
       saveState(state, { skipSync: true });

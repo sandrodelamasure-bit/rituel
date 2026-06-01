@@ -1,5 +1,5 @@
 /* Rituel — Service Worker (offline-first, cache-then-network) */
-const VERSION = "rituel-v7";
+const VERSION = "rituel-v8";
 const CORE_ASSETS = [
   "./",
   "index.html",
