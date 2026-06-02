@@ -5,7 +5,7 @@
 const STORAGE_KEY = "rituel_v2";
 const LEGACY_KEYS = ["rituel_v1"];
 const THEME_KEY = "rituel_theme";
-const SYNC_KEY = "rituel_sync_v1";
+const SYNC_KEY = "rituel_sync_v2";
 
 /* ── FREQUENCY (array of JS day indices, 0=dim ... 6=sam) ─────── */
 const DAYS_ALL     = [0, 1, 2, 3, 4, 5, 6];
@@ -81,7 +81,7 @@ const QUOTES = [
 /* ── SYNC STATE (hoisted: read by saveState which runs at load time) ─ */
 const sync = {
   token: null,
-  gistId: null,
+  sha: null,          // last known SHA of the remote file (for SHA-based concurrency)
   lastPulledAt: null,
   lastPushedAt: null,
   pushTimer: null,
@@ -961,183 +961,145 @@ function toast(msg) {
   }, 2200);
 }
 
-/* ── SYNC : GitHub Gist (private) ─────────────────────────────── */
+/* ── SYNC : GitHub Contents API (private repo) ─────────────────── */
+const SYNC_OWNER  = "sandrodelamasure-bit";
+const SYNC_REPO   = "rituel-data";
+const SYNC_PATH   = "data.json";
+const SYNC_BRANCH = "main";
+
 function loadSync() {
   try {
     const raw = localStorage.getItem(SYNC_KEY);
     if (!raw) return;
-    const { token, gistId } = JSON.parse(raw);
+    const { token, sha } = JSON.parse(raw);
     sync.token = token || null;
-    sync.gistId = gistId || null;
-  } catch (e) {}
+    sync.sha   = sha   || null;
+  } catch {}
 }
 
-/**
- * Parses #sync=base64(token:gistId) from the URL, configures sync,
- * then performs a smart initial sync (push local if gist is a placeholder,
- * otherwise pull remote into local).
- */
-async function checkSyncFromUrl() {
-  const hash = location.hash || "";
-  const m = hash.match(/[#&]sync=([^&]+)/);
-  if (!m) return;
-  try {
-    const decoded = atob(m[1].replace(/-/g, "+").replace(/_/g, "/"));
-    const idx = decoded.indexOf(":");
-    if (idx < 0) return;
-    const token = decoded.slice(0, idx);
-    const gistId = decoded.slice(idx + 1);
-    if (!token || !gistId) return;
-    sync.token = token;
-    sync.gistId = gistId;
-    saveSyncConfig();
-    // Strip the hash from the URL immediately so it doesn't linger in history
-    history.replaceState(null, "", location.pathname + location.search);
-    await syncInitial();
-  } catch (e) {
-    sync.error = "Lien de sync invalide : " + e.message;
-    setSyncStatus("error");
-  }
-}
-
-async function syncInitial() {
-  if (!syncEnabled()) return;
-  sync.busy = true;
-  setSyncStatus("busy");
-  try {
-    const gist = await ghGist("GET", `/${sync.gistId}`);
-    const file = gist.files["rituel-data.json"];
-    let remote = null;
-    if (file) {
-      let content = file.content;
-      if (file.truncated && file.raw_url) {
-        content = await fetch(file.raw_url).then(r => r.text());
-      }
-      try { remote = JSON.parse(content); } catch {}
-    }
-    if (!remote || remote._placeholder || !remote.habits) {
-      // Gist is fresh — push local data up
-      sync.busy = false;
-      await syncPush();
-      toast("Synchronisation activée. Vos données sont en ligne.");
-    } else if ((state.updatedAt || 0) >= (remote.updatedAt || 0)) {
-      // Local is newer or same — push to gist
-      sync.busy = false;
-      await syncPush();
-      toast("Synchronisation activée. Vos données locales ont été envoyées.");
-    } else {
-      // Remote is newer — pull into local
-      state = remote;
-      if (!state.notes) state.notes = [];
-      saveState(state, { skipSync: true });
-      renderAll();
-      sync.lastPulledAt = Date.now();
-      toast("Synchronisation activée. Données récupérées.");
-    }
-    sync.error = null;
-    setSyncStatus("on");
-  } catch (e) {
-    sync.error = e.message;
-    setSyncStatus("error");
-    toast("Échec de l'activation : " + e.message);
-  } finally {
-    sync.busy = false;
-  }
-}
 function saveSyncConfig() {
-  if (sync.token && sync.gistId) {
-    localStorage.setItem(SYNC_KEY, JSON.stringify({ token: sync.token, gistId: sync.gistId }));
+  if (sync.token) {
+    localStorage.setItem(SYNC_KEY, JSON.stringify({ token: sync.token, sha: sync.sha }));
   } else {
     localStorage.removeItem(SYNC_KEY);
   }
 }
+
 function setSyncStatus(status) {
   const btn = document.getElementById("syncBtn");
   if (!btn) return;
   btn.dataset.status = status || "";
   btn.classList.toggle("syncing", status === "busy");
 }
-function syncEnabled() { return !!(sync.token && sync.gistId); }
 
-async function ghGist(method, path = "", body = null) {
-  const res = await fetch(`https://api.github.com/gists${path}`, {
-    method,
-    headers: {
-      "Authorization": `token ${sync.token}`,
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(body ? { "Content-Type": "application/json" } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    let msg = `GitHub ${res.status}`;
-    try { msg = JSON.parse(txt).message || msg; } catch {}
-    throw new Error(msg);
-  }
-  return res.json();
+function syncEnabled() { return !!sync.token; }
+
+/* UTF-8-safe base64 encode/decode (handles accents) */
+function utf8ToBase64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+function base64ToUtf8(b64) {
+  const bin = atob(b64.replace(/\s/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
 }
 
-async function syncCreate(token) {
-  if (!token || !token.trim()) throw new Error("Token requis.");
-  sync.token = token.trim();
-  sync.busy = true;
-  setSyncStatus("busy");
-  try {
-    const gist = await ghGist("POST", "", {
-      description: "Rituel — données personnelles (chiffré par token GitHub)",
-      public: false,
-      files: {
-        "rituel-data.json": { content: JSON.stringify(state, null, 2) },
-      },
+function ghHeaders() {
+  return {
+    "Accept": "application/vnd.github+json",
+    "Authorization": `Bearer ${sync.token}`,
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+}
+
+/* GET data.json from private repo; returns parsed object or null */
+async function ghLoad() {
+  const url = `https://api.github.com/repos/${SYNC_OWNER}/${SYNC_REPO}/contents/${SYNC_PATH}?ref=${SYNC_BRANCH}`;
+  const r = await fetch(url, { headers: ghHeaders(), cache: "no-store" });
+  if (r.status === 404) { sync.sha = null; return null; }
+  if (r.status === 401) throw new Error("Token invalide ou expiré.");
+  if (r.status === 403) throw new Error("Droits insuffisants — le token doit avoir le scope 'repo'.");
+  if (!r.ok) throw new Error(`GitHub GET ${r.status}`);
+  const body = await r.json();
+  sync.sha = body.sha || null;
+  saveSyncConfig();
+  try { return JSON.parse(base64ToUtf8(body.content || "")); } catch { return null; }
+}
+
+/* PUT data.json; SHA-based optimistic concurrency, retry once on conflict */
+async function ghSave(value) {
+  const url = `https://api.github.com/repos/${SYNC_OWNER}/${SYNC_REPO}/contents/${SYNC_PATH}`;
+  const content = utf8ToBase64(JSON.stringify(value, null, 2));
+  const payload = {
+    message: `Rituel sync ${new Date().toISOString().slice(0, 16)}`,
+    content,
+    branch: SYNC_BRANCH,
+  };
+  if (sync.sha) payload.sha = sync.sha;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...ghHeaders() },
+      body: JSON.stringify(payload),
     });
-    sync.gistId = gist.id;
-    sync.lastPushedAt = Date.now();
-    saveSyncConfig();
-    sync.error = null;
-    setSyncStatus("on");
-    return gist.id;
-  } catch (e) {
-    sync.error = e.message;
-    sync.token = null;
-    setSyncStatus("error");
-    throw e;
-  } finally {
-    sync.busy = false;
+    if (r.ok) {
+      const j = await r.json();
+      sync.sha = j.content?.sha || null;
+      saveSyncConfig();
+      return;
+    }
+    if (r.status === 409 || r.status === 422) {
+      // SHA conflict — re-fetch to get latest SHA and retry
+      try { await ghLoad(); payload.sha = sync.sha; } catch {}
+      continue;
+    }
+    if (r.status === 401) throw new Error("Token invalide ou expiré.");
+    throw new Error(`GitHub PUT ${r.status}`);
   }
+  throw new Error("Conflit SHA persistant — réessayez dans quelques secondes.");
 }
 
-async function syncPair(token, gistId) {
-  if (!token || !token.trim()) throw new Error("Token requis.");
-  if (!gistId || !gistId.trim()) throw new Error("Code de partage requis.");
+/* Activate sync on this device: validate token, then smart push/pull */
+async function syncActivate(token) {
+  if (!token) throw new Error("Token requis.");
   sync.token = token.trim();
-  sync.gistId = gistId.trim();
   sync.busy = true;
   setSyncStatus("busy");
   try {
-    const gist = await ghGist("GET", `/${sync.gistId}`);
-    const file = gist.files["rituel-data.json"];
-    if (!file) throw new Error("Données introuvables dans ce gist.");
-    let content = file.content;
-    if (file.truncated && file.raw_url) {
-      content = await fetch(file.raw_url).then(r => r.text());
+    // Validate token & repo access
+    const testR = await fetch(`https://api.github.com/repos/${SYNC_OWNER}/${SYNC_REPO}`, {
+      headers: ghHeaders(), cache: "no-store",
+    });
+    if (testR.status === 401) throw new Error("Token invalide ou expiré.");
+    if (testR.status === 403 || testR.status === 404) throw new Error("Accès refusé. Vérifiez que le token a le scope 'repo'.");
+    if (!testR.ok) throw new Error(`GitHub ${testR.status}`);
+
+    // Compare local vs remote; keep the newest
+    const remote = await ghLoad();
+    const localNewer = !remote || !remote.habits || (state.updatedAt || 0) >= (remote.updatedAt || 0);
+    if (localNewer) {
+      sync.busy = false;
+      await syncPush();
+      toast("Synchronisation activée — données locales envoyées ✓");
+    } else {
+      state = remote;
+      if (!state.notes) state.notes = [];
+      saveState(state, { skipSync: true });
+      renderAll();
+      sync.lastPulledAt = Date.now();
+      toast("Synchronisation activée — données récupérées ✓");
     }
-    const remote = JSON.parse(content);
-    if (!remote.habits) throw new Error("Format de données invalide.");
-    state = remote;
-    if (!state.notes) state.notes = [];
-    saveState(state, { skipSync: true });
-    saveSyncConfig();
-    sync.lastPulledAt = Date.now();
     sync.error = null;
     setSyncStatus("on");
-    renderAll();
-    return true;
+    saveSyncConfig();
   } catch (e) {
     sync.error = e.message;
     sync.token = null;
-    sync.gistId = null;
     setSyncStatus("error");
     throw e;
   } finally {
@@ -1147,25 +1109,22 @@ async function syncPair(token, gistId) {
 
 async function syncPull(silent = true) {
   if (!syncEnabled() || sync.busy) return;
+  // Skip if we just pushed (< 2.5 s) — avoids self-bounce
+  if (sync.lastPushedAt && Date.now() - sync.lastPushedAt < 2500) return;
   sync.busy = true;
   setSyncStatus("busy");
   try {
-    const gist = await ghGist("GET", `/${sync.gistId}`);
-    const file = gist.files["rituel-data.json"];
-    if (!file) return;
-    let content = file.content;
-    if (file.truncated && file.raw_url) {
-      content = await fetch(file.raw_url).then(r => r.text());
-    }
-    const remote = JSON.parse(content);
-    const remoteAt = remote.updatedAt || 0;
-    const localAt = state.updatedAt || 0;
-    if (remoteAt > localAt) {
-      state = remote;
-      if (!state.notes) state.notes = [];
-      saveState(state, { skipSync: true });
-      renderAll();
-      if (!silent) toast("Données actualisées.");
+    const remote = await ghLoad();
+    if (remote && remote.habits) {
+      const remoteAt = remote.updatedAt || 0;
+      const localAt  = state.updatedAt  || 0;
+      if (remoteAt > localAt) {
+        state = remote;
+        if (!state.notes) state.notes = [];
+        saveState(state, { skipSync: true });
+        renderAll();
+        if (!silent) toast("Données actualisées.");
+      }
     }
     sync.lastPulledAt = Date.now();
     sync.error = null;
@@ -1173,7 +1132,7 @@ async function syncPull(silent = true) {
   } catch (e) {
     sync.error = e.message;
     setSyncStatus("error");
-    if (!silent) toast("Échec de la synchronisation.");
+    if (!silent) toast("Échec sync : " + e.message);
   } finally {
     sync.busy = false;
   }
@@ -1182,12 +1141,11 @@ async function syncPull(silent = true) {
 function syncPushDebounced() {
   if (!syncEnabled()) return;
   clearTimeout(sync.pushTimer);
-  sync.pushTimer = setTimeout(() => syncPush(), 1500);
+  sync.pushTimer = setTimeout(() => syncPush(), 600);
 }
 
 async function syncPush() {
   if (!syncEnabled() || sync.busy) {
-    // Retry shortly if currently busy
     if (sync.busy) {
       clearTimeout(sync.pushTimer);
       sync.pushTimer = setTimeout(() => syncPush(), 2000);
@@ -1197,9 +1155,7 @@ async function syncPush() {
   sync.busy = true;
   setSyncStatus("busy");
   try {
-    await ghGist("PATCH", `/${sync.gistId}`, {
-      files: { "rituel-data.json": { content: JSON.stringify(state, null, 2) } },
-    });
+    await ghSave(state);
     sync.lastPushedAt = Date.now();
     sync.error = null;
     setSyncStatus("on");
@@ -1212,9 +1168,9 @@ async function syncPush() {
 }
 
 function syncDisable() {
-  if (!confirm("Désactiver la synchronisation sur cet appareil ? Les données locales sont conservées et le gist GitHub n'est pas supprimé.")) return;
+  if (!confirm("Désactiver la synchronisation sur cet appareil ? Les données locales sont conservées.")) return;
   sync.token = null;
-  sync.gistId = null;
+  sync.sha = null;
   saveSyncConfig();
   setSyncStatus("");
   renderSyncModal();
@@ -1230,8 +1186,6 @@ function closeSyncModal() {
   document.getElementById("syncModal").hidden = true;
 }
 
-let syncTab = "create"; // 'create' | 'join'
-
 function renderSyncModal() {
   const body = document.getElementById("syncBody");
   if (!body) return;
@@ -1240,9 +1194,8 @@ function renderSyncModal() {
     body.innerHTML = `
       <div class="sync-section">
         <p class="sync-blurb">
-          Vos données sont synchronisées en temps réel via un <strong>gist GitHub privé</strong>.
-          Chaque modification est poussée automatiquement, et l'app récupère les changements
-          à chaque ouverture.
+          Vos données sont synchronisées via un <strong>repo GitHub privé</strong>.
+          Chaque modification est poussée en moins d'une seconde, et l'app vérifie les mises à jour toutes les 8 secondes.
         </p>
         <div class="sync-status-card">
           <div class="sync-status-line">
@@ -1250,13 +1203,8 @@ function renderSyncModal() {
             <strong>Synchronisé</strong>
             <span id="syncLastInfo">${syncLastInfoText()}</span>
           </div>
-          <span class="field-label" style="display:block;margin-bottom:8px;">Code de partage</span>
-          <div class="sync-gist-id">
-            <span>${escapeHtml(sync.gistId)}</span>
-            <button type="button" id="copyGistBtn">Copier</button>
-          </div>
           <p class="sync-help" style="margin-top:10px;">
-            Collez ce code (et le même token) dans l'app sur votre autre appareil pour le connecter.
+            Pour connecter un autre appareil, entrez le même token GitHub dans l'app sur cet appareil.
           </p>
         </div>
         ${sync.error ? `<div class="sync-error">Dernière erreur : ${escapeHtml(sync.error)}</div>` : ""}
@@ -1270,75 +1218,39 @@ function renderSyncModal() {
     `;
     document.getElementById("syncDisableBtn").addEventListener("click", syncDisable);
     document.getElementById("syncPullNowBtn").addEventListener("click", () => syncPull(false));
-    document.getElementById("copyGistBtn").addEventListener("click", () => {
-      navigator.clipboard.writeText(sync.gistId).then(() => toast("Code copié."));
-    });
   } else {
     body.innerHTML = `
       <div class="sync-section">
         <p class="sync-blurb">
-          Synchronisez vos rituels et notes entre votre Mac et votre iPhone.
-          Vos données restent <strong>chez vous</strong>, dans un gist GitHub privé que vous seul pouvez lire.
+          Synchronisez vos rituels entre Mac et iPhone. Vos données restent <strong>privées</strong> dans un repo GitHub que vous seul pouvez lire.
         </p>
-        <div class="sync-tabs">
-          <button type="button" class="sync-tab ${syncTab === "create" ? "active" : ""}" data-tab="create">Premier appareil</button>
-          <button type="button" class="sync-tab ${syncTab === "join" ? "active" : ""}" data-tab="join">Rejoindre</button>
-        </div>
         <div class="field">
-          <span class="field-label">Token GitHub <span class="field-opt">(scope <code>gist</code>)</span></span>
+          <span class="field-label">Token GitHub <span class="field-opt">(scope <code>repo</code>)</span></span>
           <input type="password" class="sync-input" id="syncTokenInput" placeholder="ghp_…" autocomplete="off" spellcheck="false" />
         </div>
-        ${syncTab === "join" ? `
-          <div class="field">
-            <span class="field-label">Code de partage <span class="field-opt">(depuis le premier appareil)</span></span>
-            <input type="text" class="sync-input" id="syncGistInput" placeholder="abc123…" autocomplete="off" spellcheck="false" />
-          </div>
-          <p class="sync-help">
-            <strong style="color:var(--text-soft);">Attention :</strong> rejoindre remplace toutes les données locales par celles du gist.
-          </p>
-        ` : `
-          <p class="sync-help">
-            Premier appareil ? Je crée un gist privé avec vos données actuelles et vous obtenez un code à coller sur l'iPhone.
-          </p>
-        `}
         <p class="sync-help">
-          Pas encore de token ? <a href="https://github.com/settings/tokens/new?scopes=gist&description=Rituel%20sync" target="_blank" rel="noopener">Générez-en un</a> (scope <code>gist</code> uniquement).
+          Même token sur tous vos appareils — pas de "code de partage" à transmettre.<br>
+          Pas encore de token ? <a href="https://github.com/settings/tokens/new?scopes=repo&description=Rituel%20sync" target="_blank" rel="noopener">Créez-en un ici</a> (scope <code>repo</code>).
         </p>
         ${sync.error ? `<div class="sync-error">${escapeHtml(sync.error)}</div>` : ""}
         <div class="modal-actions" style="border:none;padding-top:0;margin-top:4px;">
           <div class="spacer"></div>
           <button type="button" class="ghost-btn" data-close-sync="1">Annuler</button>
-          <button type="button" class="primary-btn" id="syncActivateBtn">
-            ${syncTab === "create" ? "Créer la synchronisation" : "Rejoindre"}
-          </button>
+          <button type="button" class="primary-btn" id="syncActivateBtn">Activer la synchronisation</button>
         </div>
       </div>
     `;
-    body.querySelectorAll(".sync-tab").forEach(t => {
-      t.addEventListener("click", () => { syncTab = t.dataset.tab; renderSyncModal(); });
-    });
     document.getElementById("syncActivateBtn").addEventListener("click", async () => {
       const tokenInput = document.getElementById("syncTokenInput");
       const btn = document.getElementById("syncActivateBtn");
       const token = tokenInput.value.trim();
-      if (!token) {
-        sync.error = "Token requis.";
-        renderSyncModal();
-        return;
-      }
+      if (!token) { sync.error = "Token requis."; renderSyncModal(); return; }
       btn.disabled = true;
       btn.textContent = "…";
       try {
-        if (syncTab === "create") {
-          await syncCreate(token);
-          toast("Synchronisation activée.");
-        } else {
-          const gistId = document.getElementById("syncGistInput").value.trim();
-          await syncPair(token, gistId);
-          toast("Appareil connecté.");
-        }
+        await syncActivate(token);
         renderSyncModal();
-      } catch (e) {
+      } catch {
         renderSyncModal();
       }
     });
@@ -1381,16 +1293,16 @@ function wire() {
     if (e.key === "Escape" && !document.getElementById("syncModal").hidden) closeSyncModal();
   });
 
-  // Pull from gist when app comes back to foreground / network returns
+  // Pull when app comes back to foreground or network returns
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && syncEnabled()) syncPull(true);
   });
   window.addEventListener("online", () => { if (syncEnabled()) syncPull(true); });
 
-  // Periodic pull every 30 s to catch changes from other devices
+  // Polling every 8 s while tab is visible
   setInterval(() => {
     if (syncEnabled() && document.visibilityState === "visible") syncPull(true);
-  }, 30_000);
+  }, 8_000);
 
   // Modal close
   document.getElementById("modal").addEventListener("click", e => {
@@ -1491,11 +1403,8 @@ renderAll();
 renderQuote();
 wire();
 
-// Check for magic-link sync activation first, then normal pull
 (async () => {
-  if (location.hash && location.hash.includes("sync=")) {
-    await checkSyncFromUrl();
-  } else if (syncEnabled()) {
+  if (syncEnabled()) {
     setSyncStatus("on");
     syncPull(true);
   } else {
